@@ -1,0 +1,10 @@
+# Logs and backups produced by test runs
+*.log
+*.bak.*
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store

@@ -1,0 +1,3 @@
+# Scripts are self-contained; allow following any file passed with -x
+external-sources=true
+enable=avoid-nullary-conditions
