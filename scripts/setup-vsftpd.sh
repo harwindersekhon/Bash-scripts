@@ -122,12 +122,25 @@ append_line_once() {
         printf '%s[dry-run]%s append to %s: %s\n' "$C_BLU" "$C_RST" "$file" "$line" >&2
         return 0
     fi
+    mkdir -p "$(dirname "$file")"
+    # Hand-edited files often lack a final newline; don't glue onto the last line.
+    if [[ -s "$file" && -n "$(tail -c 1 "$file")" ]]; then
+        printf '\n' >>"$file"
+    fi
     printf '%s\n' "$line" >>"$file"
 }
 
 # --- prompts ------------------------------------------------------------------
 # Every prompt is skipped when its variable is already set (from a flag or the
 # environment). With NONINTERACTIVE=1 the default is taken silently.
+
+# require_tty "Question"  Die with a clear message when there is no terminal to
+# prompt on (ssh without -t, cron, CI) instead of failing inside read.
+require_tty() {
+    if ! { true </dev/tty; } 2>/dev/null; then
+        die "No terminal to ask '${1}' - use --yes and pass the value as a flag or environment variable"
+    fi
+}
 
 # ask "Question" "default" VAR
 ask() {
@@ -138,6 +151,7 @@ ask() {
         printf -v "$_var" '%s' "$_def"
         return 0
     fi
+    require_tty "$_q"
     while true; do
         if [[ -n "$_def" ]]; then
             read -r -p "${_q} [${_def}]: " _reply </dev/tty
@@ -160,6 +174,7 @@ ask_yn() {
     elif [[ "$NONINTERACTIVE" == 1 ]]; then
         _reply=$_def
     else
+        require_tty "$_q"
         while true; do
             read -r -p "${_q} [${_hint}]: " _reply </dev/tty
             _reply=${_reply:-$_def}
@@ -196,6 +211,7 @@ ask_choice() {
         printf -v "$_var" '%s' "${_keys[0]}"
         return 0
     fi
+    require_tty "$_q"
     printf '%s\n' "$_q" >&2
     for _i in "${!_keys[@]}"; do
         printf '  %d) %s\n' "$((_i + 1))" "${_descs[_i]}" >&2
@@ -231,6 +247,7 @@ ask_secret() {
         ASK_SECRET_GENERATED=1
         return 0
     fi
+    require_tty "$_q"
     while true; do
         if [[ "$_gen" == gen ]]; then
             read -r -s -p "${_q} (empty = generate): " _p1 </dev/tty
@@ -419,7 +436,9 @@ selinux_fcontext() {
 # primary_subnet  Print the CIDR of the interface holding the default route.
 primary_subnet() {
     local dev cidr
-    dev=$(ip -o route show default 2>/dev/null | awk '{print $5; exit}')
+    # "default via GW dev X ..." or "default dev X ..." (point-to-point links)
+    dev=$(ip -o route show default 2>/dev/null |
+        awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }')
     [[ -n "$dev" ]] || return 0
     cidr=$(ip -o -f inet addr show "$dev" 2>/dev/null | awk '{print $4; exit}')
     [[ -n "$cidr" ]] || return 0
@@ -702,7 +721,11 @@ main() {
         "existing-user:Grant an existing system user access" \
         "anonymous:Anonymous read-only downloads"
     ask "Passive port range" "40000-40100" PASV_RANGE
-    [[ "$PASV_RANGE" =~ ^[0-9]+-[0-9]+$ ]] || die "Passive range must look like 40000-40100"
+    [[ "$PASV_RANGE" =~ ^([0-9]+)-([0-9]+)$ ]] || die "Passive range must look like 40000-40100"
+    local pasv_min=$((10#${BASH_REMATCH[1]})) pasv_max=$((10#${BASH_REMATCH[2]}))
+    ((pasv_min >= 1024 && pasv_max <= 65535 && pasv_min <= pasv_max)) ||
+        die "Passive range must be MIN-MAX within 1024-65535 with MIN <= MAX (got ${PASV_RANGE})"
+    PASV_RANGE="${pasv_min}-${pasv_max}"
     ask_yn "Enable TLS (FTPS) with a self-signed certificate?" n ENABLE_TLS
     if [[ "$ACCESS_MODE" != anonymous ]]; then
         ask_yn "Jail (chroot) users to their FTP directory?" y CHROOT_USERS

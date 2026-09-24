@@ -121,12 +121,25 @@ append_line_once() {
         printf '%s[dry-run]%s append to %s: %s\n' "$C_BLU" "$C_RST" "$file" "$line" >&2
         return 0
     fi
+    mkdir -p "$(dirname "$file")"
+    # Hand-edited files often lack a final newline; don't glue onto the last line.
+    if [[ -s "$file" && -n "$(tail -c 1 "$file")" ]]; then
+        printf '\n' >>"$file"
+    fi
     printf '%s\n' "$line" >>"$file"
 }
 
 # --- prompts ------------------------------------------------------------------
 # Every prompt is skipped when its variable is already set (from a flag or the
 # environment). With NONINTERACTIVE=1 the default is taken silently.
+
+# require_tty "Question"  Die with a clear message when there is no terminal to
+# prompt on (ssh without -t, cron, CI) instead of failing inside read.
+require_tty() {
+    if ! { true </dev/tty; } 2>/dev/null; then
+        die "No terminal to ask '${1}' - use --yes and pass the value as a flag or environment variable"
+    fi
+}
 
 # ask "Question" "default" VAR
 ask() {
@@ -137,6 +150,7 @@ ask() {
         printf -v "$_var" '%s' "$_def"
         return 0
     fi
+    require_tty "$_q"
     while true; do
         if [[ -n "$_def" ]]; then
             read -r -p "${_q} [${_def}]: " _reply </dev/tty
@@ -159,6 +173,7 @@ ask_yn() {
     elif [[ "$NONINTERACTIVE" == 1 ]]; then
         _reply=$_def
     else
+        require_tty "$_q"
         while true; do
             read -r -p "${_q} [${_hint}]: " _reply </dev/tty
             _reply=${_reply:-$_def}
@@ -195,6 +210,7 @@ ask_choice() {
         printf -v "$_var" '%s' "${_keys[0]}"
         return 0
     fi
+    require_tty "$_q"
     printf '%s\n' "$_q" >&2
     for _i in "${!_keys[@]}"; do
         printf '  %d) %s\n' "$((_i + 1))" "${_descs[_i]}" >&2
@@ -230,6 +246,7 @@ ask_secret() {
         ASK_SECRET_GENERATED=1
         return 0
     fi
+    require_tty "$_q"
     while true; do
         if [[ "$_gen" == gen ]]; then
             read -r -s -p "${_q} (empty = generate): " _p1 </dev/tty
@@ -418,7 +435,9 @@ selinux_fcontext() {
 # primary_subnet  Print the CIDR of the interface holding the default route.
 primary_subnet() {
     local dev cidr
-    dev=$(ip -o route show default 2>/dev/null | awk '{print $5; exit}')
+    # "default via GW dev X ..." or "default dev X ..." (point-to-point links)
+    dev=$(ip -o route show default 2>/dev/null |
+        awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }')
     [[ -n "$dev" ]] || return 0
     cidr=$(ip -o -f inet addr show "$dev" 2>/dev/null | awk '{print $4; exit}')
     [[ -n "$cidr" ]] || return 0
@@ -455,6 +474,7 @@ DEPLOY_INFO="${DEPLOY_INFO:-}"           # y | n
 
 GENERATED_PASSWORDS=()
 MYSQL_AUTH_FILE=""
+ROOT_SOCKET_LOGIN=y # n on MariaDB < 10.4, where root gets password-only auth
 
 usage() {
     cat <<EOF
@@ -586,15 +606,50 @@ mysql_root() {
     fi
 }
 
+# mysql_root_query SQL  Print the result rows (no header) as the root user.
+# Read-only, so it also runs in dry-run mode when a server is reachable.
+mysql_root_query() {
+    if [[ "$DRY_RUN" == 1 ]]; then return 0; fi
+    if [[ -n "$MYSQL_AUTH_FILE" ]]; then
+        mysql --defaults-extra-file="$MYSQL_AUTH_FILE" -N -B -e "$1"
+    else
+        mysql -u root -N -B -e "$1"
+    fi
+}
+
+# mariadb_at_least MAJOR MINOR  True if the server is that version or newer
+# (or unknown, e.g. in a dry run).
+mariadb_at_least() {
+    local ver major minor
+    ver=$(mysql_root_query 'SELECT VERSION()' 2>/dev/null || true)
+    ver=${ver%%-*}
+    major=${ver%%.*}
+    minor=${ver#*.}
+    minor=${minor%%.*}
+    [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]] || return 0
+    ((major > $1 || (major == $1 && minor >= $2)))
+}
+
 secure_mariadb() {
-    local pw
+    local pw drop_users root_auth
     pw=$(sql_escape "$DB_ROOT_PASSWORD")
     log_info "Securing MariaDB (root password, anonymous users, test DB, remote root)"
-    # Root keeps unix-socket login (sudo mysql) and also accepts the password.
+    # Anonymous users and remote root are dropped by name: DROP USER works on
+    # every MariaDB version, whereas mysql.global_priv only exists from 10.4 on
+    # (RHEL 8's default stream and Ubuntu 20.04 ship 10.3).
+    drop_users=$(mysql_root_query "SELECT CONCAT('DROP USER IF EXISTS ', QUOTE(User), '@', QUOTE(Host), ';')
+        FROM mysql.user WHERE User='' OR (User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1'))")
+    if mariadb_at_least 10 4; then
+        # Root keeps unix-socket login (sudo mysql) and also accepts the password.
+        root_auth="IDENTIFIED VIA mysql_native_password USING PASSWORD('${pw}') OR unix_socket"
+    else
+        ROOT_SOCKET_LOGIN=n
+        log_warn "MariaDB older than 10.4: root will log in with the password only (no unix_socket login)"
+        root_auth="IDENTIFIED BY '${pw}'"
+    fi
     mysql_root <<SQL
-ALTER USER 'root'@'localhost' IDENTIFIED VIA mysql_native_password USING PASSWORD('${pw}') OR unix_socket;
-DELETE FROM mysql.global_priv WHERE User='';
-DELETE FROM mysql.global_priv WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
+ALTER USER 'root'@'localhost' ${root_auth};
+${drop_users}
 DROP DATABASE IF EXISTS test;
 DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';
 FLUSH PRIVILEGES;
@@ -803,7 +858,11 @@ EOF
     if is_yes "$DEPLOY_INFO"; then
         printf '  PHP info    : %sinfo.php  (remove it when done testing!)\n' "$url"
     fi
-    printf '  MariaDB     : root via "sudo mysql" or the root password\n'
+    if is_yes "$ROOT_SOCKET_LOGIN"; then
+        printf '  MariaDB     : root via "sudo mysql" or the root password\n'
+    else
+        printf '  MariaDB     : root via "mysql -u root -p" (password only on this MariaDB version)\n'
+    fi
     if is_yes "$CREATE_APP_DB"; then
         printf '  App DB      : %s (user %s@localhost)\n' "$APP_DB_NAME" "$APP_DB_USER"
     fi

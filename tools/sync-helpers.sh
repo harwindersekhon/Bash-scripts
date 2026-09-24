@@ -19,6 +19,10 @@ ref=$(extract "$SKELETON")
 [[ -n "$ref" ]] || { echo "No helper block found in ${SKELETON}" >&2; exit 1; }
 
 mode=${1:-sync}
+case "$mode" in
+    sync | --check) ;;
+    *) echo "Usage: $0 [--check]" >&2; exit 2 ;;
+esac
 status=0
 for f in "${ROOT}"/scripts/*.sh; do
     rel=${f#"${ROOT}/"}

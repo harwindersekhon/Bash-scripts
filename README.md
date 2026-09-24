@@ -104,7 +104,9 @@ Asks for:
 - whether to add a `phpinfo()` test page
 
 MariaDB is secured without prompts: anonymous users, the test database and
-remote root are removed. Root keeps socket login (`sudo mysql`).
+remote root are removed. Root keeps socket login (`sudo mysql`) on MariaDB 10.4
+and newer; on older releases (RHEL 8's default stream, Ubuntu 20.04) root
+authenticates with the password only, and the script says so.
 
 ```bash
 sudo ./scripts/install-lamp.sh
